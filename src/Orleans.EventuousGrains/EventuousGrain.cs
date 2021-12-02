@@ -78,7 +78,7 @@ namespace Orlens.EventuousGrains
 
         public virtual async Task ReceiveReminder(string reminderName, TickStatus status)
         {
-            // If has unpublished event
+            // If doesn't have unpublished event
             // And hasn't added events in (PublishReminderIntervalMinutes * 2)
             // Then unregister the publish events reminder
             if (reminderName == PublishReminderName 
