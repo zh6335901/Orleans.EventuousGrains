@@ -13,7 +13,7 @@ namespace Orlens.EventuousGrains
     /// </summary>
     internal interface IPublishable : IGrain
     {
-        Task PublishEvents(bool saveAfterPublished);
+        Task PublishEvents(bool saveAfterPublished, bool throwOnPublishError);
     }
 
     public abstract class EventuousGrain<TState> : Grain, IRemindable, IPublishable where TState : new()
@@ -58,7 +58,7 @@ namespace Orlens.EventuousGrains
             _stream = streamProvider.GetStream<object>(this.GetPrimaryKey(), _streamOptions.Namespace);
 
             _publishEventsTimer = RegisterTimer(
-                state => this.AsReference<IPublishable>().PublishEvents(true),
+                state => this.AsReference<IPublishable>().PublishEvents(true, false),
                 state: null,
                 dueTime: TimeSpan.FromSeconds(_publishOptions.PublishTimerIntervalSeconds),
                 period: TimeSpan.FromSeconds(_publishOptions.PublishTimerIntervalSeconds));
@@ -116,7 +116,7 @@ namespace Orlens.EventuousGrains
             }
         }
 
-        public async Task PublishEvents(bool saveAfterPublished)
+        public async Task PublishEvents(bool saveAfterPublished, bool throwOnPublishError)
         {
             var eventQueue = _storage.State.UnpublishedEvents;
             var anyEventPublished = false;
@@ -136,6 +136,8 @@ namespace Orlens.EventuousGrains
                         "Occur error when publish event {@event}, Grain id {@grainId}, Silo Id {@siloId}",
                         @event, this.GetPrimaryKey(), RuntimeIdentity);
 
+                    if (throwOnPublishError) throw;
+
                     break;
                 }
             }
@@ -148,7 +150,7 @@ namespace Orlens.EventuousGrains
 
         protected async Task SafeClear()
         {
-            await PublishEvents(false);
+            await PublishEvents(false, true);
             await _storage.ClearStateAsync();
 
             _storage.State = new EventuousState<TState>();
@@ -182,7 +184,7 @@ namespace Orlens.EventuousGrains
 
             if (publishEventsImmediately && HasUnpublishedEvents)
             {
-                await PublishEvents(true);
+                await PublishEvents(true, false);
             }
 
             async Task DeactivateOnError(Func<Task> func)
