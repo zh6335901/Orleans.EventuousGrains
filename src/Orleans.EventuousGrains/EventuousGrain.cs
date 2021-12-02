@@ -135,6 +135,8 @@ namespace Orlens.EventuousGrains
                         _publishErrorEventId, ex,
                         "Occur error when publish event {@event}, Grain id {@grainId}, Silo Id {@siloId}",
                         @event, this.GetPrimaryKey(), RuntimeIdentity);
+
+                    break;
                 }
             }
 
