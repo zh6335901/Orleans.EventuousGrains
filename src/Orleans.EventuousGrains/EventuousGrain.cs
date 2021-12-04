@@ -11,32 +11,32 @@ namespace Orlens.EventuousGrains
     /// <summary>
     /// In order to make grain's publish events timer keep 'grain call semantic'
     /// </summary>
-    internal interface IPublishable : IGrain
+    internal interface IEventuousTiming : IGrain
     {
-        Task PublishEvents(bool saveAfterPublished, bool throwOnPublishError);
+        Task PublishEventsByTimer();
     }
 
-    public abstract class EventuousGrain<TState> : Grain, IRemindable, IPublishable where TState : new()
+    public abstract class EventuousGrain<TState> : Grain, IRemindable, IEventuousTiming where TState : new()
     {
-        private readonly static EventId _publishErrorEventId = new EventId(9000001, "PublishError");
-
-        private IAsyncStream<object> _stream;
-        private IStorage<EventuousState<TState>> _storage;
-        private IGrainReminder _publishEventsReminder;
-        private IDisposable _publishEventsTimer;
+        private readonly static EventId _publishErrorEventId = new EventId(9000001, "PublishingError");
 
         private readonly PublishOptions _publishOptions;
         private readonly StreamOptions _streamOptions;
         private readonly ILogger _logger;
 
-        protected EventuousGrain(PublishOptions publishOptions, StreamOptions streamOptions, ILogger logger) 
+        private IAsyncStream<object> _stream;
+        private IStorage<EventuousState<TState>> _storage;
+        private IGrainReminder _publishingReminder;
+        private IDisposable _publishingTimer;
+
+        protected EventuousGrain(PublishOptions publishOptions, StreamOptions streamOptions, ILogger logger)
         {
             _publishOptions = publishOptions;
             _streamOptions = streamOptions;
             _logger = logger;
         }
 
-        protected readonly static string PublishReminderName = "Eventuous-PublishEvents";
+        protected readonly static string PublishingReminderName = "Eventuous-PublishingReminder";
 
         protected IReadOnlyCollection<object> UnpublishedEvents => _storage.State.UnpublishedEvents;
 
@@ -56,12 +56,6 @@ namespace Orlens.EventuousGrains
 
             var streamProvider = GetStreamProvider(_streamOptions.Provider);
             _stream = streamProvider.GetStream<object>(this.GetPrimaryKey(), _streamOptions.Namespace);
-
-            _publishEventsTimer = RegisterTimer(
-                state => this.AsReference<IPublishable>().PublishEvents(true, false),
-                state: null,
-                dueTime: TimeSpan.FromSeconds(_publishOptions.PublishTimerIntervalSeconds),
-                period: TimeSpan.FromSeconds(_publishOptions.PublishTimerIntervalSeconds));
         }
 
         public override async Task OnDeactivateAsync()
@@ -70,28 +64,30 @@ namespace Orlens.EventuousGrains
 
             if (!HasUnpublishedEvents)
             {
-                try { await UnregisterPublishEventsReminder(); } catch { /* Ignore.. */ }
+                try { await UnregisterPublishingReminder(); } catch { /* Ignore.. */ }
             }
-
-            _publishEventsTimer?.Dispose();
         }
 
         public virtual async Task ReceiveReminder(string reminderName, TickStatus status)
         {
-            // If doesn't have unpublished event
-            // And hasn't added events in (PublishReminderIntervalMinutes * 2)
-            // Then unregister the publish events reminder
-            if (reminderName == PublishReminderName 
-                && !HasUnpublishedEvents 
-                && (DateTimeOffset.Now - LastAddEventTime) 
-                    > TimeSpan.FromMinutes(_publishOptions.PublishReminderIntervalMinutes * 2))
+            if (reminderName == PublishingReminderName)
             {
-                if (_publishEventsReminder == null)
-                {
-                    _publishEventsReminder = await GetReminder(reminderName);
-                }
+                _publishingReminder ??= await GetReminder(reminderName);
 
-                await UnregisterPublishEventsReminder();
+                // If doesn't has unpublished events
+                // And hasn't added events in (PublishReminderIntervalMinutes * 2)
+                // Then unregister the publish events reminder
+                if (!HasUnpublishedEvents
+                    && (DateTimeOffset.Now - (LastAddEventTime ?? status.FirstTickTime))
+                        >= TimeSpan.FromMinutes(_publishOptions.PublishReminderIntervalMinutes * 2))
+                {
+                    await UnregisterPublishingReminder();
+                    UnregisterPublishingTimer();
+                }
+                else if (HasUnpublishedEvents)
+                {
+                    RegisterPublishingTimer();
+                }
             }
         }
 
@@ -116,7 +112,74 @@ namespace Orlens.EventuousGrains
             }
         }
 
-        public async Task PublishEvents(bool saveAfterPublished, bool throwOnPublishError)
+        Task IEventuousTiming.PublishEventsByTimer()
+        {
+            return PublishEvents(true, false);
+        }
+
+        protected async Task SafeClear()
+        {
+            await PublishEvents(false, true);
+            await _storage.ClearStateAsync();
+
+            _storage.State = new EventuousState<TState>();
+        }
+
+        protected Task Commit()
+        {
+            return _storage.WriteStateAsync();
+        }
+
+        protected Task CommitWithEvent(object @event, bool publishEventsImmediately = true)
+            => CommitWithEvents(new[] { @event }, publishEventsImmediately);
+
+        protected async Task CommitWithEvents(
+            IEnumerable<object> events,
+            bool publishEventsImmediately = true)
+        {
+            events = events?.Where(e => e != null) ?? Enumerable.Empty<object>();
+
+            if (events.Count() > 0)
+            {
+                await DeactivateOnError(async () =>
+                {
+                    await RegisterPublishingReminder();
+                    RegisterPublishingTimer();
+                });
+            }
+
+            foreach (var @event in events ?? Enumerable.Empty<object>())
+            {
+                _storage.State.AddEvent(@event);
+            }
+
+            await DeactivateOnError(_storage.WriteStateAsync);
+
+            if (publishEventsImmediately && HasUnpublishedEvents)
+            {
+                await PublishEvents(true, false);
+            }
+
+            async Task DeactivateOnError(Func<Task> func)
+            {
+                try
+                {
+                    await func.Invoke();
+                }
+                catch
+                {
+                    DeactivateOnIdle();
+                    throw;
+                }
+            }
+        }
+
+        protected Task Reload()
+        {
+            return _storage.ReadStateAsync();
+        }
+
+        private async Task PublishEvents(bool saveAfterPublished, bool throwOnPublishError)
         {
             var eventQueue = _storage.State.UnpublishedEvents;
             var anyEventPublished = false;
@@ -148,82 +211,38 @@ namespace Orlens.EventuousGrains
             }
         }
 
-        protected async Task SafeClear()
+        private async Task RegisterPublishingReminder()
         {
-            await PublishEvents(false, true);
-            await _storage.ClearStateAsync();
+            var interval = TimeSpan.FromMinutes(_publishOptions.PublishReminderIntervalMinutes);
 
-            _storage.State = new EventuousState<TState>();
+            _publishingReminder ??= await RegisterOrUpdateReminder(
+                PublishingReminderName, dueTime: interval, period: interval);
         }
 
-        protected Task Commit()
+        private async Task UnregisterPublishingReminder()
         {
-            return _storage.WriteStateAsync();
-        }
-
-        protected Task CommitWithEvent(object @event, bool publishEventsImmediately = true)
-            => CommitWithEvents(new[] { @event }, publishEventsImmediately);
-
-        protected async Task CommitWithEvents(
-            IEnumerable<object> events,
-            bool publishEventsImmediately = true)
-        {
-            events = events?.Where(e => e != null) ?? Enumerable.Empty<object>();
-
-            if (events.Count() > 0)
+            if (_publishingReminder != null)
             {
-                await DeactivateOnError(RegisterPublishEventsReminder);
-            }
-
-            foreach (var @event in events ?? Enumerable.Empty<object>())
-            {
-                _storage.State.AddEvent(@event);
-            }
-
-            await DeactivateOnError(_storage.WriteStateAsync);
-
-            if (publishEventsImmediately && HasUnpublishedEvents)
-            {
-                await PublishEvents(true, false);
-            }
-
-            async Task DeactivateOnError(Func<Task> func)
-            {
-                try 
-                {
-                    await func.Invoke();
-                }
-                catch
-                {
-                    DeactivateOnIdle();
-                    throw;
-                }
+                await UnregisterReminder(_publishingReminder);
+                _publishingReminder = null;
             }
         }
 
-        protected Task Reload()
+        private void RegisterPublishingTimer()
         {
-            return _storage.ReadStateAsync();
+            var interval = TimeSpan.FromSeconds(_publishOptions.PublishTimerIntervalSeconds);
+
+            _publishingTimer ??= RegisterTimer(
+                state => this.AsReference<IEventuousTiming>().PublishEventsByTimer(),
+                state: null,
+                dueTime: interval,
+                period: interval);
         }
 
-        private async Task RegisterPublishEventsReminder()
+        private void UnregisterPublishingTimer()
         {
-            if (_publishEventsReminder == null)
-            {
-                _publishEventsReminder = await RegisterOrUpdateReminder(
-                    PublishReminderName,
-                    dueTime: TimeSpan.FromMinutes(_publishOptions.PublishReminderIntervalMinutes),
-                    period: TimeSpan.FromMinutes(_publishOptions.PublishReminderIntervalMinutes));
-            }
-        }
-
-        private async Task UnregisterPublishEventsReminder()
-        {
-            if (_publishEventsReminder != null)
-            {
-                await UnregisterReminder(_publishEventsReminder);
-                _publishEventsReminder = null;
-            }
+            _publishingTimer?.Dispose();
+            _publishingTimer = null;
         }
     }
 }
